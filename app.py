@@ -4,6 +4,7 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import plotly.express as px
+import time
 
 st.set_page_config(page_title="Auditoría BIM & Cumplimiento BEP - APV", page_icon="📋", layout="wide")
 st.title("📋 Dashboard Integral de Auditoría BIM - APV")
@@ -114,31 +115,70 @@ def generar_xml_navisworks(df_errores, nombre_set="Auditoria_APV_Elementos_Vacio
     xml += '</exchange>'
     return xml
 
-# CARGA EXCLUSIVA DESDE PARQUET (sin alternativa Excel)
+# DIAGNÓSTICO TEMPORAL: CARGA EXCLUSIVA DESDE PARQUET
+# Este bloque no usa Excel ni caché para identificar dónde se detiene la ejecución.
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-RUTA_PARQUET = os.path.join(BASE_DIR, "resumen_ifc_consolidado.parquet")
+RUTA_PARQUET = os.path.join(
+    BASE_DIR,
+    "resumen_ifc_consolidado.parquet"
+)
 
-@st.cache_data(show_spinner="Cargando datos desde Parquet...")
-def cargar_datos():
-    if not os.path.isfile(RUTA_PARQUET):
-        raise FileNotFoundError(
-            f"No se encontró el archivo Parquet: {RUTA_PARQUET}"
-        )
+print("[DIAG 1] Inicio de carga del Parquet", flush=True)
+print(f"[DIAG] Ruta: {RUTA_PARQUET}", flush=True)
 
-    df_raw = pd.read_parquet(RUTA_PARQUET, engine="pyarrow")
-    df_raw = df_raw.loc[:, ~df_raw.columns.duplicated()]
-    return df_raw
+if not os.path.isfile(RUTA_PARQUET):
+    st.error(f"No se encuentra el archivo: {RUTA_PARQUET}")
+    print("[DIAG ERROR] El archivo no existe", flush=True)
+    st.stop()
 
 try:
-    df_original = cargar_datos()
+    inicio = time.perf_counter()
+
+    with st.spinner("Leyendo archivo Parquet..."):
+        # Temporalmente sin @st.cache_data para diagnosticar la lectura real.
+        df_original = pd.read_parquet(
+            RUTA_PARQUET,
+            engine="pyarrow"
+        )
+
+    duracion = time.perf_counter() - inicio
+
+    print(
+        f"[DIAG 2] Lectura completada: "
+        f"{df_original.shape[0]} filas, "
+        f"{df_original.shape[1]} columnas, "
+        f"{duracion:.2f} segundos",
+        flush=True
+    )
+
+    st.success(
+        f"Parquet leído correctamente en {duracion:.2f} segundos."
+    )
+    st.write(
+        f"Registros: {len(df_original):,} | "
+        f"Columnas: {len(df_original.columns):,}"
+    )
+
 except Exception as e:
-    st.error("⚠️ No se pudo cargar el archivo Parquet.")
+    print(f"[DIAG ERROR] {type(e).__name__}: {e}", flush=True)
+    st.error("Error al leer el archivo Parquet.")
     st.exception(e)
     st.stop()
 
+# Evitar nombres de columna duplicados antes de procesar la auditoría.
+df_original = df_original.loc[
+    :, ~df_original.columns.duplicated()
+].copy()
+
 if df_original.empty:
-    st.error("⚠️ El archivo Parquet existe, pero no contiene registros.")
+    st.error("El archivo Parquet no contiene registros.")
     st.stop()
+
+print(
+    "[DIAG 3] Preparación inicial completada. "
+    "Continúa el procesamiento de la auditoría.",
+    flush=True
+)
 
 if "Peso_Archivo_MB" not in df_original.columns:
     df_original["Peso_Archivo_MB"] = 0.0
