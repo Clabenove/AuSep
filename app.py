@@ -6,7 +6,12 @@ import numpy as np
 import plotly.express as px
 import time
 
-st.set_page_config(page_title="Auditoría BIM & Cumplimiento BEP - APV", page_icon="📋", layout="wide")
+st.set_page_config(
+    page_title="Auditoría BIM & Cumplimiento BEP - APV", 
+    page_icon="📋", 
+    layout="wide"
+)
+
 st.title("📋 Dashboard Integral de Auditoría BIM - APV")
 
 # Lista exclusiva y sin duplicados de los parámetros oficiales APV
@@ -115,70 +120,30 @@ def generar_xml_navisworks(df_errores, nombre_set="Auditoria_APV_Elementos_Vacio
     xml += '</exchange>'
     return xml
 
-# DIAGNÓSTICO TEMPORAL: CARGA EXCLUSIVA DESDE PARQUET
-# Este bloque no usa Excel ni caché para identificar dónde se detiene la ejecución.
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-RUTA_PARQUET = os.path.join(
-    BASE_DIR,
-    "resumen_ifc_consolidado.parquet"
-)
-
-print("[DIAG 1] Inicio de carga del Parquet", flush=True)
-print(f"[DIAG] Ruta: {RUTA_PARQUET}", flush=True)
+RUTA_PARQUET = os.path.join(BASE_DIR, "resumen_ifc_consolidado.parquet")
 
 if not os.path.isfile(RUTA_PARQUET):
     st.error(f"No se encuentra el archivo: {RUTA_PARQUET}")
-    print("[DIAG ERROR] El archivo no existe", flush=True)
     st.stop()
 
+@st.cache_data
+rekt = None # Dummy cache anchor
+def cargar_datos(ruta):
+    df = pd.read_parquet(ruta, engine="pyarrow")
+    return df.loc[:, ~df.columns.duplicated()].copy()
+
 try:
-    inicio = time.perf_counter()
-
-    with st.spinner("Leyendo archivo Parquet..."):
-        # Temporalmente sin @st.cache_data para diagnosticar la lectura real.
-        df_original = pd.read_parquet(
-            RUTA_PARQUET,
-            engine="pyarrow"
-        )
-
-    duracion = time.perf_counter() - inicio
-
-    print(
-        f"[DIAG 2] Lectura completada: "
-        f"{df_original.shape[0]} filas, "
-        f"{df_original.shape[1]} columnas, "
-        f"{duracion:.2f} segundos",
-        flush=True
-    )
-
-    st.success(
-        f"Parquet leído correctamente en {duracion:.2f} segundos."
-    )
-    st.write(
-        f"Registros: {len(df_original):,} | "
-        f"Columnas: {len(df_original.columns):,}"
-    )
-
+    with st.spinner("Leyendo archivo Parquet optimizado..."):
+        df_original = cargar_datos(RUTA_PARQUET)
 except Exception as e:
-    print(f"[DIAG ERROR] {type(e).__name__}: {e}", flush=True)
     st.error("Error al leer el archivo Parquet.")
     st.exception(e)
     st.stop()
 
-# Evitar nombres de columna duplicados antes de procesar la auditoría.
-df_original = df_original.loc[
-    :, ~df_original.columns.duplicated()
-].copy()
-
 if df_original.empty:
     st.error("El archivo Parquet no contiene registros.")
     st.stop()
-
-print(
-    "[DIAG 3] Preparación inicial completada. "
-    "Continúa el procesamiento de la auditoría.",
-    flush=True
-)
 
 if "Peso_Archivo_MB" not in df_original.columns:
     df_original["Peso_Archivo_MB"] = 0.0
@@ -191,52 +156,27 @@ if "ID_Elemento" not in df_original.columns:
 for col in PARAMETROS_APV:
     if col not in df_original.columns:
         df_original[col] = np.nan
-print(f"[DIAG 4] Parámetros APV preparados: {df_original.shape[0]} filas x {df_original.shape[1]} columnas", flush=True)
 
 st.sidebar.header("⚙ Filtros de Auditoría")
 incluir_geo = st.sidebar.checkbox("Incluir Psets 09 (Geotecnia)", value=False)
 params_auditar = PARAMETROS_APV if incluir_geo else [p for p in PARAMETROS_APV if not p.startswith("09")]
 
-ocultar_fantasmas = st.sidebar.checkbox(
-    "Omitir sub-elementos fantasma (sin ningún Pset APV)",
-    value=True
-)
-unificar_duplicados = st.sidebar.checkbox(
-    "Eliminar/Unificar elementos duplicados (quedarse con dato lleno)",
-    value=False  # Temporalmente desactivado para diagnosticar rendimiento
-)
+ocultar_fantasmas = st.sidebar.checkbox("Omitir sub-elementos fantasma (sin ningún Pset APV)", value=True)
 
 archivos_disp = sorted(df_original["Archivo_Origen"].dropna().unique().tolist())
 sel_archivos = st.sidebar.multiselect("Modelos IFC Auditados:", archivos_disp, default=archivos_disp)
 df = df_original[df_original["Archivo_Origen"].isin(sel_archivos)].copy()
-print(f"[DIAG 5] Filtro de modelos completado: {df.shape[0]} filas x {df.shape[1]} columnas", flush=True)
 
-if unificar_duplicados and not df.empty:
-    print("[DIAG 6A] Inicio de unificación de duplicados", flush=True)
-    df = df.replace(["", "nan", "None", "<NA>"], np.nan)
-    df = df.groupby(["Archivo_Origen", "GlobalId"], as_index=False).first()
-    print(f"[DIAG 6B] Unificación terminada: {df.shape[0]} filas x {df.shape[1]} columnas", flush=True)
-
-print(f"[DIAG 7A] Inicio de cálculo de presencia APV: {len(df):,} filas x {len(params_auditar)} parámetros", flush=True)
-
-# Procesar una columna APV cada vez para evitar crear matrices de texto gigantes.
-# Para 228.832 filas x 79 parámetros, las matrices intermedias pueden agotar
-# la memoria disponible en Streamlit Community Cloud.
+# Cálculo eficiente de presencia APV vectorizado por lotes
 cant_apv_presentes = np.zeros(len(df), dtype=np.uint16)
 valores_vacios = ["", "nan", "none", "<na>"]
-for numero_col, col in enumerate(params_auditar, start=1):
+for col in params_auditar:
     serie = df[col]
     texto = serie.astype(str).str.strip().str.lower()
     es_presente = serie.notna() & ~texto.isin(valores_vacios)
     cant_apv_presentes += es_presente.to_numpy(dtype=np.uint16)
-    if numero_col % 20 == 0 or numero_col == len(params_auditar):
-        print(
-            f"[DIAG 7A] Procesados {numero_col}/{len(params_auditar)} parámetros",
-            flush=True
-        )
 
 df["Cant_APV_Presentes"] = cant_apv_presentes
-print("[DIAG 7B] Cálculo de presencia APV terminado", flush=True)
 
 archivos_totalmente_vacios = []
 for arch_name, grp_raw in df.groupby("Archivo_Origen"):
@@ -247,9 +187,9 @@ n_fantasmas_detectados = int((df["Cant_APV_Presentes"] == 0).sum())
 if ocultar_fantasmas and n_fantasmas_detectados > 0:
     if (df["Cant_APV_Presentes"] > 0).sum() > 0:
         df = df[(df["Cant_APV_Presentes"] > 0) | (df["Archivo_Origen"].isin(archivos_totalmente_vacios))].copy()
-        st.sidebar.success(f"🧹 Se filtraron {n_fantasmas_detectados} sub-elementos internos sin Psets APV. Auditando {len(df)} elementos reales.")
+        st.sidebar.success(f"🧹 Se filtraron {n_fantasmas_detectados} sub-elementos internos sin Psets APV.")
 
-print("[DIAG 8A] Inicio del cálculo de parámetros vacíos y comodines", flush=True)
+# Optimización en el cálculo de vacíos para evitar congelamientos en despliegue
 dict_vacios_elem = {idx: [] for idx in df.index}
 dict_comodines_elem = {idx: 0 for idx in df.index}
 
@@ -266,9 +206,8 @@ df["Cant_Vacios"] = [len(dict_vacios_elem[i]) for i in df.index]
 df["Cant_Comodines"] = [dict_comodines_elem[i] for i in df.index]
 df["Tiene_Vacios"] = df["Cant_Vacios"] > 0
 df["Parámetros_Vacíos"] = [", ".join(dict_vacios_elem[i]) for i in df.index]
-print("[DIAG 8B] Cálculo de vacíos terminado; comenzando a construir las pestañas", flush=True)
 
-# 8 pestañas originales + 1 nueva pestaña "Grupos de parámetros"
+# 9 Pestañas de la aplicación
 tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs([
     "📖 1. Cumplimiento BEP Naming",
     "🌍 2. Georreferenciación",
@@ -278,11 +217,9 @@ tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs([
     "🎯 6. Navisworks Manage",
     "❤️ 7. Salud del Proyecto",
     "🚨 8. Alertas IFCs Vacíos",
-    "Grupos de parámetros"
+    "📐 9. Grupos de parámetros"
 ])
 
-# --- PESTAÑA 1: CUMPLIMIENTO BEP NAMING ---
-print("[DIAG TAB 1] Inicio de la pestaña 1", flush=True)
 with tab1:
     st.subheader("1. Cumplimiento BEP Naming (Anejo 02)")
     res_naming = []
@@ -300,8 +237,6 @@ with tab1:
         })
     st.dataframe(pd.DataFrame(res_naming), use_container_width=True)
 
-# --- PESTAÑA 2: GEORREFERENCIACIÓN ---
-print("[DIAG TAB 2] Inicio de la pestaña 2", flush=True)
 with tab2:
     st.subheader("2. Auditoría de Georreferenciación (ETRS89 / IfcSite)")
     res_geo = []
@@ -327,8 +262,6 @@ with tab2:
     else:
         st.success("✅ Consistencia espacial verificada en el emplazamiento (IfcSite).")
 
-# --- PESTAÑA 3: INTEGRIDAD IFC ---
-print("[DIAG TAB 3] Inicio de la pestaña 3", flush=True)
 with tab3:
     st.subheader("3. Integridad IFC y Clasificación de Entidades")
     conteo_clases = df.groupby(["Archivo_Origen", "Clase_IFC"]).size().reset_index(name="Cantidad")
@@ -338,14 +271,12 @@ with tab3:
     proxys = df[df["Clase_IFC"] == "IfcBuildingElementProxy"]
     st.metric("Elementos Genéricos (IfcBuildingElementProxy)", len(proxys))
     if not proxys.empty:
-        st.warning("Listado de elementos genéricos detectados (con su ID de Elemento):")
-        st.dataframe(proxys[["Archivo_Origen", "ID_Elemento", "GlobalId", "Clase_IFC", "Nombre"]], use_container_width=True)
+        st.warning("Listado de elementos genéricos detectados (primeros 500 registros):")
+        st.dataframe(proxys[["Archivo_Origen", "ID_Elemento", "GlobalId", "Clase_IFC", "Nombre"]].head(500), use_container_width=True)
 
-# --- PESTAÑA 4: CALIDAD DE FORMATO ---
-print("[DIAG TAB 4] Inicio de la pestaña 4", flush=True)
 with tab4:
     st.subheader("4. Calidad de Formato (Estricto APV vs BEP)")
-    st.markdown("El comodín **`-`** está permitido por el BEP y no genera error. Se auditan unidades, estados, espacios en blanco y textos comodín inválidos.")
+    st.markdown("El comodín **`-`** está permitido por el BEP y no genera error.")
     
     errores_fmt = []
     uni_validas = ["ud", "m", "m2", "dm3", "m3", "kg", "tn", "pa"]
@@ -378,19 +309,20 @@ with tab4:
                     "Contenido Detectado": v,
                     "Infracción BEP": " + ".join(mot)
                 })
+            if len(errores_fmt) >= 2000: # Límite de seguridad para evitar saturación de memoria
+                break
+        if len(errores_fmt) >= 2000:
+            break
+
     if errores_fmt:
         df_err_fmt = pd.DataFrame(errores_fmt)
-        st.error(f"⚠️ Se detectaron {len(df_err_fmt)} errores de formato en contra del BEP.")
+        st.error(f"⚠️ Se detectaron errores de formato en contra del BEP (mostrando primeros {len(df_err_fmt)} registros).")
         st.dataframe(df_err_fmt, use_container_width=True)
     else:
         st.success("✅ Todos los parámetros rellenos cumplen con el formato del BEP.")
 
-# --- PESTAÑA 5: AUDITORÍA DE VACÍOS ---
-print("[DIAG TAB 5] Inicio de la pestaña 5", flush=True)
 with tab5:
     st.subheader(f"5. Auditoría Exclusiva de los {len(params_auditar)} Parámetros Oficiales APV")
-    st.markdown("Si un parámetro contiene **`-`**, se valida como **Comodín BEP en Verde (`🟢`)**. Si faltan elementos (`🔴`), **a la derecha tienes sus IDs exactos (`ID_Elemento` y `GlobalId`) para localizarlos em tu NWD**.")
-    
     resumen_params = []
     total_el = len(df)
     for p in params_auditar:
@@ -412,8 +344,8 @@ with tab5:
             guids_faltantes = "-"
         else:
             estado_str = f"🔴 Faltan {n_vac} elementos"
-            ids_faltantes = ", ".join(df.loc[es_vac, "ID_Elemento"].astype(str).tolist())
-            guids_faltantes = ", ".join(df.loc[es_vac, "GlobalId"].astype(str).tolist())
+            ids_faltantes = ", ".join(df.loc[es_vac, "ID_Elemento"].astype(str).tolist()[:50])
+            guids_faltantes = ", ".join(df.loc[es_vac, "GlobalId"].astype(str).tolist()[:50])
             
         resumen_params.append({
             "Parámetro Oficial APV": p,
@@ -422,8 +354,8 @@ with tab5:
             "Con Comodín (-) Válido": n_com,
             "Vacíos (Error)": n_vac,
             "% Cumplimiento (Dato + '-')": pct_valido,
-            "ID_Elemento Faltantes (Revit/C3D)": ids_faltantes,
-            "GlobalId Faltantes (NWD/IFC)": guids_faltantes
+            "ID_Elemento Faltantes": ids_faltantes,
+            "GlobalId Faltantes": guids_faltantes
         })
     df_res_vacios = pd.DataFrame(resumen_params)
     
@@ -436,21 +368,19 @@ with tab5:
 
     df_elem_incompletos = df[df["Tiene_Vacios"]]
     if not df_elem_incompletos.empty:
-        st.markdown("#### 🔍 Detalle directo de los Elementos que tienen algún parámetro vacío:")
+        st.markdown("#### 🔍 Detalle de los Elementos Incompletos (Primeros 1,000 registros):")
         st.dataframe(
-            df_elem_incompletos[["Archivo_Origen", "ID_Elemento", "GlobalId", "Clase_IFC", "Nombre", "Cant_Vacios", "Parámetros_Vacíos"]],
+            df_elem_incompletos[["Archivo_Origen", "ID_Elemento", "GlobalId", "Clase_IFC", "Nombre", "Cant_Vacios", "Parámetros_Vacíos"]].head(1000),
             use_container_width=True
         )
 
-# --- PESTAÑA 6: NAVISWORKS MANAGE ---
-print("[DIAG TAB 6] Inicio de la pestaña 6", flush=True)
 with tab6:
     st.subheader("6. Centro de Coordinación e Interferencias de Datos para Navisworks Manage")
     df_con_vacios = df[df["Tiene_Vacios"]]
     
     c1, c2 = st.columns(2)
     with c1:
-        st.markdown("#### 📥 1. Descargar Search Sets XML para Navisworks (.NWD / .NWF)")
+        st.markdown("#### 📥 1. Descargar Search Sets XML para Navisworks")
         param_filtro_nw = st.selectbox("Seleccionar grupo de elementos vacíos a aislar:", ["TODOS los elementos con algún vacío"] + params_auditar)
         if param_filtro_nw == "TODOS los elementos con algún vacío":
             df_target_nw = df_con_vacios
@@ -460,7 +390,7 @@ with tab6:
             df_target_nw = df[df[param_filtro_nw].isna() | s_col_nw.str.lower().isin(["", "nan", "none", "<na>"])]
             nombre_xml = f"APV_Vacio_{param_filtro_nw}"
             
-        usar_id_nativo = st.checkbox("Usar ID_Elemento nativo (Tag) en lugar de GlobalId para el XML", value=True)
+        usar_id_nativo = st.checkbox("Usar ID_Elemento nativo (Tag) en lugar de GlobalId", value=True)
         st.write(f"Elementos seleccionados para el XML: **{len(df_target_nw)}**")
         
         if not df_target_nw.empty:
@@ -475,20 +405,18 @@ with tab6:
             st.info("No hay elementos vacíos para este filtro seleccionado.")
             
     with c2:
-        st.markdown("#### 🔍 2. Auditoría e Interferencias de Datos (IDs Duplicados y Huérfanos)")
+        st.markdown("#### 🔍 2. Auditoría de Duplicados")
         if not df.empty and "ID_Elemento" in df.columns:
             duplicados_id = df[df.duplicated(subset=["Archivo_Origen", "ID_Elemento"], keep=False)]
             n_dups = len(duplicados_id)
             if n_dups > 0:
-                st.warning(f"⚠️ Se detectaron **{n_dups} elementos** con ID_Elemento duplicado dentro del mismo modelo:")
-                st.dataframe(duplicados_id[["Archivo_Origen", "ID_Elemento", "GlobalId", "Clase_IFC", "Nombre"]], use_container_width=True)
+                st.warning(f"⚠️ Se detectaron **{n_dups} elementos** con ID_Elemento duplicado:")
+                st.dataframe(duplicados_id[["Archivo_Origen", "ID_Elemento", "GlobalId", "Clase_IFC", "Nombre"]].head(500), use_container_width=True)
             else:
                 st.success("✅ No existen ID_Elemento duplicados en los modelos auditados.")
         else:
             st.info("Sin datos para analizar duplicados.")
 
-# --- PESTAÑA 7: SALUD DEL PROYECTO ---
-print("[DIAG TAB 7] Inicio de la pestaña 7", flush=True)
 with tab7:
     st.subheader("7. Salud del Proyecto y Métricas Generales")
     c_s1, c_s2, c_s3 = st.columns(3)
@@ -502,8 +430,6 @@ with tab7:
         fig_peso = px.bar(df_pesos, x="Archivo_Origen", y="Peso_Archivo_MB", title="Peso de Modelos IFC (MB)", text="Peso_Archivo_MB")
         st.plotly_chart(fig_peso, use_container_width=True)
 
-# --- PESTAÑA 8: ALERTAS IFCS VACÍOS ---
-print("[DIAG TAB 8] Inicio de la pestaña 8", flush=True)
 with tab8:
     st.subheader("🚨 8. Alertas y Diagnóstico de IFCs Vacíos por Modelo")
     resumen_modelos_alt = []
@@ -524,11 +450,9 @@ with tab8:
         resumen_modelos_alt.append({"Archivo IFC": arch, "Elementos": tot, "Estado General": est})
     st.dataframe(pd.DataFrame(resumen_modelos_alt), use_container_width=True)
 
-# --- PESTAÑA 9: GRUPOS DE PARÁMETROS ---
-print("[DIAG TAB 9] Inicio de la pestaña 9", flush=True)
 with tab9:
     st.subheader("📐 Grupos de parámetros")
-    st.markdown("Informe detallado por modelo sobre los bloques y grupos de parámetros detectados según la directriz del BEP (**Geotecnia = 11 grupos**; **Resto de modelos = 9 grupos**).")
+    st.markdown("Informe detallado por modelo sobre los bloques y grupos de parámetros detectados según el BEP.")
     
     if "Archivo_Origen" in df_original.columns:
         info_grupos = []
@@ -538,7 +462,6 @@ with tab9:
             df_m = df_original[df_original["Archivo_Origen"] == arch]
             nombre_inf = arch.lower()
             
-            # Criterio BEP estricto: Geotecnia = 11 grupos, Resto = 9 grupos
             if "geo" in nombre_inf:
                 tipo_modelo = "Modelo de Geotecnia"
                 grupos_teoricos = 11
@@ -546,7 +469,6 @@ with tab9:
                 tipo_modelo = "Modelo Estándar / Proyecto"
                 grupos_teoricos = 9
                 
-            # Identificar prefijos de grupos con datos o comodines presentes
             grupos_hallados = set()
             for c in cols_todas_apv:
                 prefijo = c.split("_")[0] if "_" in c else ""
