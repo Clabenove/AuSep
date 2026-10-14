@@ -203,7 +203,7 @@ ocultar_fantasmas = st.sidebar.checkbox(
 )
 unificar_duplicados = st.sidebar.checkbox(
     "Eliminar/Unificar elementos duplicados (quedarse con dato lleno)",
-    value=True
+    value=False
 )
 
 archivos_disp = sorted(df_original["Archivo_Origen"].dropna().unique().tolist())
