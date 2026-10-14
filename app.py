@@ -203,7 +203,7 @@ ocultar_fantasmas = st.sidebar.checkbox(
 )
 unificar_duplicados = st.sidebar.checkbox(
     "Eliminar/Unificar elementos duplicados (quedarse con dato lleno)",
-    value=False
+    value=False  # Temporalmente desactivado para diagnosticar rendimiento
 )
 
 archivos_disp = sorted(df_original["Archivo_Origen"].dropna().unique().tolist())
@@ -218,9 +218,24 @@ if unificar_duplicados and not df.empty:
     print(f"[DIAG 6B] Unificación terminada: {df.shape[0]} filas x {df.shape[1]} columnas", flush=True)
 
 print(f"[DIAG 7A] Inicio de cálculo de presencia APV: {len(df):,} filas x {len(params_auditar)} parámetros", flush=True)
-matriz_apv = df[params_auditar].astype(str).apply(lambda s: s.str.strip())
-matriz_llena = df[params_auditar].notna() & ~matriz_apv.apply(lambda s: s.str.lower().isin(["", "nan", "none", "<na>"]))
-df["Cant_APV_Presentes"] = matriz_llena.sum(axis=1)
+
+# Procesar una columna APV cada vez para evitar crear matrices de texto gigantes.
+# Para 228.832 filas x 79 parámetros, las matrices intermedias pueden agotar
+# la memoria disponible en Streamlit Community Cloud.
+cant_apv_presentes = np.zeros(len(df), dtype=np.uint16)
+valores_vacios = ["", "nan", "none", "<na>"]
+for numero_col, col in enumerate(params_auditar, start=1):
+    serie = df[col]
+    texto = serie.astype(str).str.strip().str.lower()
+    es_presente = serie.notna() & ~texto.isin(valores_vacios)
+    cant_apv_presentes += es_presente.to_numpy(dtype=np.uint16)
+    if numero_col % 20 == 0 or numero_col == len(params_auditar):
+        print(
+            f"[DIAG 7A] Procesados {numero_col}/{len(params_auditar)} parámetros",
+            flush=True
+        )
+
+df["Cant_APV_Presentes"] = cant_apv_presentes
 print("[DIAG 7B] Cálculo de presencia APV terminado", flush=True)
 
 archivos_totalmente_vacios = []
