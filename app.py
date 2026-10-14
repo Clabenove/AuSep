@@ -114,21 +114,30 @@ def generar_xml_navisworks(df_errores, nombre_set="Auditoria_APV_Elementos_Vacio
     xml += '</exchange>'
     return xml
 
-@st.cache_data
+# CARGA EXCLUSIVA DESDE PARQUET (sin alternativa Excel)
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+RUTA_PARQUET = os.path.join(BASE_DIR, "resumen_ifc_consolidado.parquet")
+
+@st.cache_data(show_spinner="Cargando datos desde Parquet...")
 def cargar_datos():
-    if os.path.exists("resumen_ifc_consolidado.parquet"):
-        return pd.read_parquet("resumen_ifc_consolidado.parquet")
-    elif os.path.exists("resumen_ifc_consolidado.csv"):
-        return pd.read_csv("resumen_ifc_consolidado.csv", low_memory=False)
-    else:
-        return None
-    df_raw = pd.read_csv("resumen_ifc_consolidado.csv", sheet_name=0, engine="calamine")
+    if not os.path.isfile(RUTA_PARQUET):
+        raise FileNotFoundError(
+            f"No se encontró el archivo Parquet: {RUTA_PARQUET}"
+        )
+
+    df_raw = pd.read_parquet(RUTA_PARQUET, engine="pyarrow")
     df_raw = df_raw.loc[:, ~df_raw.columns.duplicated()]
     return df_raw
 
-df_original = cargar_datos()
-if df_original is None or df_original.empty:
-    st.error("⚠️ No se encontró 'resumen_ifc_consolidado.csv'. Ejecuta `python convertidor_ifc.py` primero.")
+try:
+    df_original = cargar_datos()
+except Exception as e:
+    st.error("⚠️ No se pudo cargar el archivo Parquet.")
+    st.exception(e)
+    st.stop()
+
+if df_original.empty:
+    st.error("⚠️ El archivo Parquet existe, pero no contiene registros.")
     st.stop()
 
 if "Peso_Archivo_MB" not in df_original.columns:
