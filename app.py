@@ -1,5 +1,6 @@
 import os
 import re
+import gc
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -13,7 +14,6 @@ st.set_page_config(
 
 st.title("📋 Dashboard Integral de Auditoría BIM - APV")
 
-# Lista exclusiva y sin duplicados de los parámetros oficiales APV
 PARAMETROS_APV = list(dict.fromkeys([
     "01_01_APV_PROYECTO", "01_02_APV_FASE",
     "01_03_APV_ESTADO", "01_04_APV_TIPOLOGIA",
@@ -89,7 +89,15 @@ PARAMETROS_APV = list(dict.fromkeys([
     "10_01_APV_ENLACE A FOTO", "10_02_APV_FECHA", "10_03_APV_DISCIPLINA"
 ]))
 
+PARAMS_NO_GEO = [p for p in PARAMETROS_APV if not p.startswith("09")]
+PARAMS_GEO = [p for p in PARAMETROS_APV if p.startswith("09")]
 VALORES_VACIOS = {"", "nan", "none", "<na>", "null"}
+
+
+def es_serie_vacia(s):
+    if s.isna().all():
+        return pd.Series(True, index=s.index)
+    return s.isna() | s.astype(str).str.strip().str.lower().isin(VALORES_VACIOS)
 
 
 def diagnosticar_nombre_bep(nombre_archivo):
@@ -187,47 +195,63 @@ if not os.path.isfile(RUTA_PARQUET):
     st.stop()
 
 
-@st.cache_data(show_spinner="Cargando base de datos BIM...")
-def cargar_y_preparar_datos(ruta):
-    df_load = pd.read_parquet(ruta, engine="pyarrow")
-    df_load = df_load.loc[:, ~df_load.columns.duplicated()].copy()
+# @st.cache_resource evita clonar el DataFrame en RAM (clave para 1GB limit)
+@st.cache_resource(show_spinner="Cargando e indexando 228k elementos BIM...")
+def cargar_motor_datos(ruta):
+    df_raw = pd.read_parquet(ruta, engine="pyarrow")
+    df_raw = df_raw.loc[:, ~df_raw.columns.duplicated()]
 
-    if "Peso_Archivo_MB" not in df_load.columns:
-        df_load["Peso_Archivo_MB"] = 0.0
+    if "Peso_Archivo_MB" not in df_raw.columns:
+        df_raw["Peso_Archivo_MB"] = np.float32(0.0)
     else:
-        df_load["Peso_Archivo_MB"] = pd.to_numeric(
-            df_load["Peso_Archivo_MB"], errors="coerce"
-        ).fillna(0.0)
+        df_raw["Peso_Archivo_MB"] = pd.to_numeric(
+            df_raw["Peso_Archivo_MB"], errors="coerce"
+        ).fillna(0.0).astype(np.float32)
 
-    if "ID_Elemento" not in df_load.columns:
-        df_load["ID_Elemento"] = df_load.get("GlobalId", "Sin_ID")
+    if "ID_Elemento" not in df_raw.columns:
+        df_raw["ID_Elemento"] = df_raw.get("GlobalId", "Sin_ID")
 
-    cols_faltantes = [c for c in PARAMETROS_APV if c not in df_load.columns]
-    if cols_faltantes:
-        for col in cols_faltantes:
-            df_load[col] = np.nan
+    for col in PARAMETROS_APV:
+        if col not in df_raw.columns:
+            df_raw[col] = np.nan
 
-    return df_load
+    n = len(df_raw)
+    pres_base = np.zeros(n, dtype=np.uint8)
+    vac_base = np.zeros(n, dtype=np.uint8)
+
+    for col in PARAMS_NO_GEO:
+        v = es_serie_vacia(df_raw[col]).to_numpy()
+        vac_base += v.astype(np.uint8)
+        pres_base += (~v).astype(np.uint8)
+
+    pres_geo = np.zeros(n, dtype=np.uint8)
+    vac_geo = np.zeros(n, dtype=np.uint8)
+
+    for col in PARAMS_GEO:
+        v = es_serie_vacia(df_raw[col]).to_numpy()
+        vac_geo += v.astype(np.uint8)
+        pres_geo += (~v).astype(np.uint8)
+
+    df_raw["_pres_base"] = pres_base
+    df_raw["_vac_base"] = vac_base
+    df_raw["_pres_geo"] = pres_geo
+    df_raw["_vac_geo"] = vac_geo
+
+    gc.collect()
+    return df_raw
 
 
 try:
-    df_original = cargar_y_preparar_datos(RUTA_PARQUET)
+    df_original = cargar_motor_datos(RUTA_PARQUET)
 except Exception as e:
-    st.error("Error al leer el archivo Parquet.")
+    st.error("Error al procesar el archivo Parquet.")
     st.exception(e)
     st.stop()
 
-if df_original.empty:
-    st.error("El archivo Parquet no contiene registros.")
-    st.stop()
-
-# --- BARRA LATERAL Y FILTROS ---
+# --- BARRA LATERAL Y FILTROS (SIN COPIAR EL DATAFRAME) ---
 st.sidebar.header("⚙ Filtros de Auditoría")
 incluir_geo = st.sidebar.checkbox("Incluir Psets 09 (Geotecnia)", value=False)
-if incluir_geo:
-    params_auditar = PARAMETROS_APV
-else:
-    params_auditar = [p for p in PARAMETROS_APV if not p.startswith("09")]
+params_auditar = PARAMETROS_APV if incluir_geo else PARAMS_NO_GEO
 
 ocultar_fantasmas = st.sidebar.checkbox(
     "Omitir sub-elementos fantasma (sin ningún Pset APV)", value=True
@@ -247,52 +271,46 @@ if not sel_archivos:
     st.warning("Selecciona al menos un modelo IFC en la barra lateral.")
     st.stop()
 
-df = df_original[df_original["Archivo_Origen"].isin(sel_archivos)].copy()
+# Creación de máscara booleana ligera (0 copias en RAM)
+mask = df_original["Archivo_Origen"].isin(sel_archivos)
 
-if unificar_duplicados and not df.empty:
-    df = df.drop_duplicates(
+if unificar_duplicados:
+    mask = mask & (~df_original.duplicated(
         subset=["Archivo_Origen", "GlobalId"], keep="first"
-    ).copy()
+    ))
 
-# --- CÁLCULO VECTORIZADO POR COLUMNA ---
-n_filas = len(df)
-cant_apv_presentes = np.zeros(n_filas, dtype=np.uint16)
-cant_vacios = np.zeros(n_filas, dtype=np.uint16)
-cant_comodines = np.zeros(n_filas, dtype=np.uint16)
+if incluir_geo:
+    s_pres = df_original["_pres_base"] + df_original["_pres_geo"]
+    s_vac = df_original["_vac_base"] + df_original["_vac_geo"]
+else:
+    s_pres = df_original["_pres_base"]
+    s_vac = df_original["_vac_base"]
 
-for col in params_auditar:
-    s = df[col]
-    s_str = s.astype(str).str.strip()
-    es_vacio = (s.isna() | s_str.str.lower().isin(VALORES_VACIOS)).to_numpy()
-    es_comodin = (s_str == "-").to_numpy()
+# Detectar modelos completamente vacíos
+archivos_vacios = []
+for arch_name in sel_archivos:
+    m_arch = (df_original["Archivo_Origen"] == arch_name) & mask
+    if s_pres[m_arch].sum() == 0:
+        archivos_vacios.append(arch_name)
 
-    cant_vacios += es_vacio.astype(np.uint16)
-    cant_comodines += es_comodin.astype(np.uint16)
-    cant_apv_presentes += (~es_vacio).astype(np.uint16)
-
-df["Cant_APV_Presentes"] = cant_apv_presentes
-df["Cant_Vacios"] = cant_vacios
-df["Cant_Comodines"] = cant_comodines
-df["Tiene_Vacios"] = cant_vacios > 0
-
-archivos_totalmente_vacios = [
-    arch_name for arch_name, grp_raw in df.groupby("Archivo_Origen")
-    if (grp_raw["Cant_APV_Presentes"] > 0).sum() == 0
-]
-
-n_fantasmas_detectados = int((df["Cant_APV_Presentes"] == 0).sum())
-if ocultar_fantasmas and n_fantasmas_detectados > 0:
-    if (df["Cant_APV_Presentes"] > 0).sum() > 0:
-        cond_real = df["Cant_APV_Presentes"] > 0
-        cond_vacio = df["Archivo_Origen"].isin(archivos_totalmente_vacios)
-        df = df[cond_real | cond_vacio].copy()
+n_fantasmas = int(((s_pres == 0) & mask).sum())
+if ocultar_fantasmas and n_fantasmas > 0:
+    if (s_pres[mask] > 0).sum() > 0:
+        mask = mask & (
+            (s_pres > 0) | df_original["Archivo_Origen"].isin(archivos_vacios)
+        )
         st.sidebar.success(
-            f"🧹 Filtrados {n_fantasmas_detectados:,} sub-elementos "
-            f"sin Psets APV. Auditando {len(df):,} elementos."
+            f"🧹 Omitidos {n_fantasmas:,} sub-elementos fantasma. "
+            f"Auditando {int(mask.sum()):,} elementos reales."
         )
 
-# --- PESTAÑAS ---
-tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs([
+# Vista ligera indexada
+df = df_original.loc[mask]
+s_vac_df = s_vac.loc[mask]
+s_tiene_vacios = s_vac_df > 0
+
+# --- NAVEGACIÓN LAZY-LOAD (EVITA RENDERIZAR 9 PESTAÑAS A LA VEZ) ---
+SECCIONES = [
     "📖 1. Cumplimiento BEP Naming",
     "🌍 2. Georreferenciación",
     "🧱 3. Integridad IFC",
@@ -302,10 +320,17 @@ tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs([
     "❤️ 7. Salud del Proyecto",
     "🚨 8. Alertas IFCs Vacíos",
     "📐 9. Grupos de parámetros"
-])
+]
 
-# --- PESTAÑA 1 ---
-with tab1:
+seccion = st.radio(
+    "Sección de Auditoría:",
+    SECCIONES,
+    horizontal=True
+)
+st.divider()
+
+# --- SECCIÓN 1 ---
+if seccion == SECCIONES[0]:
     st.subheader("1. Cumplimiento BEP Naming (Anejo 02)")
     res_naming = []
     for arch, grp in df.groupby("Archivo_Origen"):
@@ -314,7 +339,7 @@ with tab1:
             grp["Esquema_IFC"].iloc[0]
             if "Esquema_IFC" in grp.columns else "No definido"
         )
-        peso = grp["Peso_Archivo_MB"].iloc[0]
+        peso = float(grp["Peso_Archivo_MB"].iloc[0])
         es_ifc_ok = (
             "IFC4" in str(esquema).upper()
             or "IFC2X3" in str(esquema).upper()
@@ -324,13 +349,13 @@ with tab1:
             "Cumple Nomenclatura BEP (y Razón Exacta)": diag,
             "Esquema IFC": esquema,
             "Estado Esquema": "✅ IFC4 / IFC2x3" if es_ifc_ok else "⚠️ Revisar",
-            "Peso Extraído (MB)": peso,
+            "Peso Extraído (MB)": round(peso, 2),
             "Elementos Reales Auditados": len(grp)
         })
     st.dataframe(pd.DataFrame(res_naming), use_container_width=True)
 
-# --- PESTAÑA 2 ---
-with tab2:
+# --- SECCIÓN 2 ---
+elif seccion == SECCIONES[1]:
     st.subheader("2. Auditoría de Georreferenciación (ETRS89 / IfcSite)")
     res_geo = []
     for arch, grp in df.groupby("Archivo_Origen"):
@@ -375,8 +400,8 @@ with tab2:
             "✅ Consistencia espacial verificada en el emplazamiento (IfcSite)."
         )
 
-# --- PESTAÑA 3 ---
-with tab3:
+# --- SECCIÓN 3 ---
+elif seccion == SECCIONES[2]:
     st.subheader("3. Integridad IFC y Clasificación de Entidades")
     conteo_clases = (
         df.groupby(["Archivo_Origen", "Clase_IFC"])
@@ -397,19 +422,19 @@ with tab3:
     st.metric("Elementos Genéricos (IfcBuildingElementProxy)", len(proxys))
     if not proxys.empty:
         st.warning(
-            f"Mostrando primeros 1.000 de {len(proxys):,} "
+            f"Mostrando primeros 500 de {len(proxys):,} "
             "elementos genéricos detectados:"
         )
         cols_proxy = [
             "Archivo_Origen", "ID_Elemento", "GlobalId", "Clase_IFC", "Nombre"
         ]
         st.dataframe(
-            proxys[cols_proxy].head(1000),
+            proxys[cols_proxy].head(500),
             use_container_width=True
         )
 
-# --- PESTAÑA 4 ---
-with tab4:
+# --- SECCIÓN 4 ---
+elif seccion == SECCIONES[3]:
     st.subheader("4. Calidad de Formato (Estricto APV vs BEP)")
     st.markdown(
         "El comodín **`-`** está permitido por el BEP y no genera error. "
@@ -455,7 +480,7 @@ with tab4:
 
         mask_err = err_esp | err_plc | err_uni | err_est
         if mask_err.any():
-            for idx in s_raw[mask_err].index[:500]:
+            for idx in s_raw[mask_err].index[:300]:
                 mot = []
                 if err_esp.loc[idx]:
                     mot.append("Espacios en blanco al inicio o final")
@@ -473,9 +498,9 @@ with tab4:
                     "Contenido Detectado": s_raw.loc[idx],
                     "Infracción BEP": " + ".join(mot)
                 })
-                if len(errores_fmt) >= 2000:
+                if len(errores_fmt) >= 1000:
                     break
-        if len(errores_fmt) >= 2000:
+        if len(errores_fmt) >= 1000:
             break
 
     if errores_fmt:
@@ -490,8 +515,8 @@ with tab4:
             "✅ Todos los parámetros rellenos cumplen con el formato del BEP."
         )
 
-# --- PESTAÑA 5 ---
-with tab5:
+# --- SECCIÓN 5 ---
+elif seccion == SECCIONES[4]:
     st.subheader(
         f"5. Auditoría Exclusiva de los {len(params_auditar)} "
         "Parámetros Oficiales APV"
@@ -499,17 +524,18 @@ with tab5:
     st.markdown(
         "Si un parámetro contiene **`-`**, se valida como **Comodín BEP "
         "en Verde (`🟢`)**. Si faltan elementos (`🔴`), se muestran "
-        "hasta 50 IDs para localizarlos en tu NWD."
+        "hasta 30 IDs de muestra para localizarlos en tu NWD."
     )
 
     resumen_params = []
     total_el = len(df)
     for p in params_auditar:
-        s_str = df[p].astype(str).str.strip()
-        es_vac = df[p].isna() | s_str.str.lower().isin(VALORES_VACIOS)
-        es_com = (s_str == "-")
+        es_vac = es_serie_vacia(df[p])
         n_vac = int(es_vac.sum())
-        n_com = int(es_com.sum())
+        if df[p].isna().all():
+            n_com = 0
+        else:
+            n_com = int((df[p].astype(str).str.strip() == "-").sum())
         n_datos = total_el - n_vac - n_com
         pct_valido = (
             round(((n_datos + n_com) / total_el) * 100, 1)
@@ -524,12 +550,9 @@ with tab5:
             ids_faltantes, guids_faltantes = "-", "-"
         else:
             estado_str = f"🔴 Faltan {n_vac:,} elementos"
-            ids_faltantes = ", ".join(
-                df.loc[es_vac, "ID_Elemento"].astype(str).head(50).tolist()
-            )
-            guids_faltantes = ", ".join(
-                df.loc[es_vac, "GlobalId"].astype(str).head(50).tolist()
-            )
+            sub_vac = df.loc[es_vac, ["ID_Elemento", "GlobalId"]].head(30)
+            ids_faltantes = ", ".join(sub_vac["ID_Elemento"].astype(str))
+            guids_faltantes = ", ".join(sub_vac["GlobalId"].astype(str))
 
         resumen_params.append({
             "Parámetro Oficial APV": p,
@@ -538,8 +561,8 @@ with tab5:
             "Con Comodín (-) Válido": n_com,
             "Vacíos (Error)": n_vac,
             "% Cumplimiento (Dato + '-')": pct_valido,
-            "ID_Elemento Faltantes (Muestra 50)": ids_faltantes,
-            "GlobalId Faltantes (Muestra 50)": guids_faltantes
+            "ID_Elemento Faltantes (Muestra 30)": ids_faltantes,
+            "GlobalId Faltantes (Muestra 30)": guids_faltantes
         })
     df_res_vacios = pd.DataFrame(resumen_params)
 
@@ -553,19 +576,15 @@ with tab5:
         use_container_width=True
     )
 
-    df_elem_inc = df[df["Tiene_Vacios"]].head(500).copy()
-    if not df_elem_inc.empty:
-        tot_inc = int(df["Tiene_Vacios"].sum())
+    tot_inc = int(s_tiene_vacios.sum())
+    if tot_inc > 0:
         st.markdown(
-            f"#### 🔍 Muestra de los primeros 500 Elementos con algún "
+            f"#### 🔍 Muestra de los primeros 300 Elementos con algún "
             f"parámetro vacío (de {tot_inc:,} totales):"
         )
-        mat_vac = (
-            df_elem_inc[params_auditar].isna()
-            | df_elem_inc[params_auditar].astype(str).apply(
-                lambda s: s.str.strip().str.lower().isin(VALORES_VACIOS)
-            )
-        )
+        df_elem_inc = df.loc[s_tiene_vacios].head(300).copy()
+        df_elem_inc["Cant_Vacios"] = s_vac_df.loc[df_elem_inc.index]
+        mat_vac = df_elem_inc[params_auditar].apply(es_serie_vacia)
         df_elem_inc["Parámetros_Vacíos"] = mat_vac.apply(
             lambda r: ", ".join(r.index[r]), axis=1
         )
@@ -575,13 +594,11 @@ with tab5:
         ]
         st.dataframe(df_elem_inc[cols_inc], use_container_width=True)
 
-# --- PESTAÑA 6 ---
-with tab6:
+# --- SECCIÓN 6 ---
+elif seccion == SECCIONES[5]:
     st.subheader(
         "6. Centro de Coordinación e Interferencias para Navisworks Manage"
     )
-    df_con_vacios = df[df["Tiene_Vacios"]]
-
     c1, c2 = st.columns(2)
     with c1:
         st.markdown("#### 📥 1. Descargar Search Sets XML para Navisworks")
@@ -592,15 +609,11 @@ with tab6:
             "Seleccionar grupo de elementos vacíos a aislar:", opciones_nw
         )
         if param_filtro_nw == "TODOS los elementos con algún vacío":
-            df_target_nw = df_con_vacios
+            df_target_nw = df.loc[s_tiene_vacios]
             nombre_xml = "APV_Todos_Los_Vacios"
         else:
-            s_col_nw = df[param_filtro_nw].astype(str).str.strip()
-            cond_nw = (
-                df[param_filtro_nw].isna()
-                | s_col_nw.str.lower().isin(VALORES_VACIOS)
-            )
-            df_target_nw = df[cond_nw]
+            cond_nw = es_serie_vacia(df[param_filtro_nw])
+            df_target_nw = df.loc[cond_nw]
             nombre_xml = f"APV_Vacio_{param_filtro_nw}"
 
         usar_id_nativo = st.checkbox(
@@ -629,12 +642,10 @@ with tab6:
     with c2:
         st.markdown("#### 🔍 2. Auditoría de IDs Duplicados")
         if not df.empty and "ID_Elemento" in df.columns:
-            duplicados_id = df[
-                df.duplicated(
-                    subset=["Archivo_Origen", "ID_Elemento"], keep=False
-                )
-            ]
-            n_dups = len(duplicados_id)
+            m_dup = df.duplicated(
+                subset=["Archivo_Origen", "ID_Elemento"], keep=False
+            )
+            n_dups = int(m_dup.sum())
             if n_dups > 0:
                 st.warning(
                     f"⚠️ Se detectaron **{n_dups:,} elementos** con "
@@ -645,7 +656,7 @@ with tab6:
                     "GlobalId", "Clase_IFC", "Nombre"
                 ]
                 st.dataframe(
-                    duplicados_id[cols_dup].head(500),
+                    df.loc[m_dup, cols_dup].head(500),
                     use_container_width=True
                 )
             else:
@@ -655,8 +666,8 @@ with tab6:
         else:
             st.info("Sin datos para analizar duplicados.")
 
-# --- PESTAÑA 7 ---
-with tab7:
+# --- SECCIÓN 7 ---
+elif seccion == SECCIONES[6]:
     st.subheader("7. Salud del Proyecto y Métricas Generales")
     c_s1, c_s2, c_s3 = st.columns(3)
     c_s1.metric("Modelos IFC Analizados", len(archivos_disp))
@@ -664,7 +675,7 @@ with tab7:
     df_pesos = (
         df_original[["Archivo_Origen", "Peso_Archivo_MB"]].drop_duplicates()
     )
-    peso_total = df_pesos["Peso_Archivo_MB"].sum()
+    peso_total = float(df_pesos["Peso_Archivo_MB"].sum())
     c_s3.metric("Peso Consolidado de Modelos", f"{round(peso_total, 2)} MB")
 
     fig_peso = px.bar(
@@ -676,13 +687,14 @@ with tab7:
     )
     st.plotly_chart(fig_peso, use_container_width=True)
 
-# --- PESTAÑA 8 ---
-with tab8:
+# --- SECCIÓN 8 ---
+elif seccion == SECCIONES[7]:
     st.subheader("🚨 8. Alertas y Diagnóstico de IFCs Vacíos por Modelo")
     resumen_modelos_alt = []
-    for arch, grp in df.groupby("Archivo_Origen"):
-        tot = len(grp)
-        n_v_m = int(grp["Tiene_Vacios"].sum())
+    for arch in archivos_disp:
+        m_a = df_original["Archivo_Origen"] == arch
+        tot = int(m_a.sum())
+        n_v_m = int((s_vac[m_a] > 0).sum())
         if tot == 0:
             est = "🚨 IFC Vacío"
         elif n_v_m == tot:
@@ -693,13 +705,13 @@ with tab8:
             est = "🟢 100% Completo"
         resumen_modelos_alt.append({
             "Archivo IFC": arch,
-            "Elementos Auditados": tot,
+            "Elementos Totales": tot,
             "Estado General": est
         })
     st.dataframe(pd.DataFrame(resumen_modelos_alt), use_container_width=True)
 
-# --- PESTAÑA 9 ---
-with tab9:
+# --- SECCIÓN 9 ---
+elif seccion == SECCIONES[8]:
     st.subheader("📐 9. Grupos de parámetros")
     st.markdown(
         "Informe detallado por modelo sobre los grupos de parámetros "
@@ -722,8 +734,7 @@ with tab9:
         grupos_hallados = set()
         for c in cols_todas_apv:
             prefijo = c.split("_")[0] if "_" in c else ""
-            s_col_m = df_m[c].dropna().astype(str).str.strip().str.lower()
-            if (~s_col_m.isin(VALORES_VACIOS)).any():
+            if not es_serie_vacia(df_m[c]).all():
                 grupos_hallados.add(prefijo)
 
         listado_str = (
