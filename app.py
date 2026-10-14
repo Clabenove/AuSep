@@ -191,6 +191,7 @@ if "ID_Elemento" not in df_original.columns:
 for col in PARAMETROS_APV:
     if col not in df_original.columns:
         df_original[col] = np.nan
+print(f"[DIAG 4] Parámetros APV preparados: {df_original.shape[0]} filas x {df_original.shape[1]} columnas", flush=True)
 
 st.sidebar.header("⚙ Filtros de Auditoría")
 incluir_geo = st.sidebar.checkbox("Incluir Psets 09 (Geotecnia)", value=False)
@@ -208,14 +209,19 @@ unificar_duplicados = st.sidebar.checkbox(
 archivos_disp = sorted(df_original["Archivo_Origen"].dropna().unique().tolist())
 sel_archivos = st.sidebar.multiselect("Modelos IFC Auditados:", archivos_disp, default=archivos_disp)
 df = df_original[df_original["Archivo_Origen"].isin(sel_archivos)].copy()
+print(f"[DIAG 5] Filtro de modelos completado: {df.shape[0]} filas x {df.shape[1]} columnas", flush=True)
 
 if unificar_duplicados and not df.empty:
+    print("[DIAG 6A] Inicio de unificación de duplicados", flush=True)
     df = df.replace(["", "nan", "None", "<NA>"], np.nan)
     df = df.groupby(["Archivo_Origen", "GlobalId"], as_index=False).first()
+    print(f"[DIAG 6B] Unificación terminada: {df.shape[0]} filas x {df.shape[1]} columnas", flush=True)
 
+print(f"[DIAG 7A] Inicio de cálculo de presencia APV: {len(df):,} filas x {len(params_auditar)} parámetros", flush=True)
 matriz_apv = df[params_auditar].astype(str).apply(lambda s: s.str.strip())
 matriz_llena = df[params_auditar].notna() & ~matriz_apv.apply(lambda s: s.str.lower().isin(["", "nan", "none", "<na>"]))
 df["Cant_APV_Presentes"] = matriz_llena.sum(axis=1)
+print("[DIAG 7B] Cálculo de presencia APV terminado", flush=True)
 
 archivos_totalmente_vacios = []
 for arch_name, grp_raw in df.groupby("Archivo_Origen"):
@@ -228,6 +234,7 @@ if ocultar_fantasmas and n_fantasmas_detectados > 0:
         df = df[(df["Cant_APV_Presentes"] > 0) | (df["Archivo_Origen"].isin(archivos_totalmente_vacios))].copy()
         st.sidebar.success(f"🧹 Se filtraron {n_fantasmas_detectados} sub-elementos internos sin Psets APV. Auditando {len(df)} elementos reales.")
 
+print("[DIAG 8A] Inicio del cálculo de parámetros vacíos y comodines", flush=True)
 dict_vacios_elem = {idx: [] for idx in df.index}
 dict_comodines_elem = {idx: 0 for idx in df.index}
 
@@ -244,6 +251,7 @@ df["Cant_Vacios"] = [len(dict_vacios_elem[i]) for i in df.index]
 df["Cant_Comodines"] = [dict_comodines_elem[i] for i in df.index]
 df["Tiene_Vacios"] = df["Cant_Vacios"] > 0
 df["Parámetros_Vacíos"] = [", ".join(dict_vacios_elem[i]) for i in df.index]
+print("[DIAG 8B] Cálculo de vacíos terminado; comenzando a construir las pestañas", flush=True)
 
 # 8 pestañas originales + 1 nueva pestaña "Grupos de parámetros"
 tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs([
@@ -259,6 +267,7 @@ tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs([
 ])
 
 # --- PESTAÑA 1: CUMPLIMIENTO BEP NAMING ---
+print("[DIAG TAB 1] Inicio de la pestaña 1", flush=True)
 with tab1:
     st.subheader("1. Cumplimiento BEP Naming (Anejo 02)")
     res_naming = []
@@ -277,6 +286,7 @@ with tab1:
     st.dataframe(pd.DataFrame(res_naming), use_container_width=True)
 
 # --- PESTAÑA 2: GEORREFERENCIACIÓN ---
+print("[DIAG TAB 2] Inicio de la pestaña 2", flush=True)
 with tab2:
     st.subheader("2. Auditoría de Georreferenciación (ETRS89 / IfcSite)")
     res_geo = []
@@ -303,6 +313,7 @@ with tab2:
         st.success("✅ Consistencia espacial verificada en el emplazamiento (IfcSite).")
 
 # --- PESTAÑA 3: INTEGRIDAD IFC ---
+print("[DIAG TAB 3] Inicio de la pestaña 3", flush=True)
 with tab3:
     st.subheader("3. Integridad IFC y Clasificación de Entidades")
     conteo_clases = df.groupby(["Archivo_Origen", "Clase_IFC"]).size().reset_index(name="Cantidad")
@@ -316,6 +327,7 @@ with tab3:
         st.dataframe(proxys[["Archivo_Origen", "ID_Elemento", "GlobalId", "Clase_IFC", "Nombre"]], use_container_width=True)
 
 # --- PESTAÑA 4: CALIDAD DE FORMATO ---
+print("[DIAG TAB 4] Inicio de la pestaña 4", flush=True)
 with tab4:
     st.subheader("4. Calidad de Formato (Estricto APV vs BEP)")
     st.markdown("El comodín **`-`** está permitido por el BEP y no genera error. Se auditan unidades, estados, espacios en blanco y textos comodín inválidos.")
@@ -359,6 +371,7 @@ with tab4:
         st.success("✅ Todos los parámetros rellenos cumplen con el formato del BEP.")
 
 # --- PESTAÑA 5: AUDITORÍA DE VACÍOS ---
+print("[DIAG TAB 5] Inicio de la pestaña 5", flush=True)
 with tab5:
     st.subheader(f"5. Auditoría Exclusiva de los {len(params_auditar)} Parámetros Oficiales APV")
     st.markdown("Si un parámetro contiene **`-`**, se valida como **Comodín BEP en Verde (`🟢`)**. Si faltan elementos (`🔴`), **a la derecha tienes sus IDs exactos (`ID_Elemento` y `GlobalId`) para localizarlos em tu NWD**.")
@@ -415,6 +428,7 @@ with tab5:
         )
 
 # --- PESTAÑA 6: NAVISWORKS MANAGE ---
+print("[DIAG TAB 6] Inicio de la pestaña 6", flush=True)
 with tab6:
     st.subheader("6. Centro de Coordinación e Interferencias de Datos para Navisworks Manage")
     df_con_vacios = df[df["Tiene_Vacios"]]
@@ -459,6 +473,7 @@ with tab6:
             st.info("Sin datos para analizar duplicados.")
 
 # --- PESTAÑA 7: SALUD DEL PROYECTO ---
+print("[DIAG TAB 7] Inicio de la pestaña 7", flush=True)
 with tab7:
     st.subheader("7. Salud del Proyecto y Métricas Generales")
     c_s1, c_s2, c_s3 = st.columns(3)
@@ -473,6 +488,7 @@ with tab7:
         st.plotly_chart(fig_peso, use_container_width=True)
 
 # --- PESTAÑA 8: ALERTAS IFCS VACÍOS ---
+print("[DIAG TAB 8] Inicio de la pestaña 8", flush=True)
 with tab8:
     st.subheader("🚨 8. Alertas y Diagnóstico de IFCs Vacíos por Modelo")
     resumen_modelos_alt = []
@@ -494,6 +510,7 @@ with tab8:
     st.dataframe(pd.DataFrame(resumen_modelos_alt), use_container_width=True)
 
 # --- PESTAÑA 9: GRUPOS DE PARÁMETROS ---
+print("[DIAG TAB 9] Inicio de la pestaña 9", flush=True)
 with tab9:
     st.subheader("📐 Grupos de parámetros")
     st.markdown("Informe detallado por modelo sobre los bloques y grupos de parámetros detectados según la directriz del BEP (**Geotecnia = 11 grupos**; **Resto de modelos = 9 grupos**).")
