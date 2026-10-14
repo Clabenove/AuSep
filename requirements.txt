@@ -1,6 +1,6 @@
 streamlit
-pandas
-numpy
-plotly
-openpyxl
+pandas 
+numpy 
+plotly 
+pyarrow 
 python-calamine
